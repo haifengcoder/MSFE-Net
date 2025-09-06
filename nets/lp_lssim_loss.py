@@ -1,78 +1,88 @@
-from math import exp
-import torch.nn.functional as F
-import torch.nn as nn
+# nets/lp_lssim_loss.py
+# 可选：稳定版重建损失（MSE + ssim_weight * (1-SSIM)），输入张量为Normalize后的域
+# 若使用本Loss，可在训练脚本中替换自定义的recon_loss调用
+
+import math
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class LpLssimLoss(nn.Module):
-    def __init__(self, window_size=5, size_average=True):
+class ReconSSIMLoss(nn.Module):
+    def __init__(self,
+                 mean: float = 0.4500517361627943,
+                 std: float = 0.26465333914691797,
+                 ssim_weight: float = 0.2,
+                 window_size: int = 5,
+                 reduction: str = "mean"):
         """
-            Constructor
+        mean/std    : 反归一化参数（与数据预处理一致）
+        ssim_weight : SSIM项的权重（建议 0.1~1.0）
+        window_size : SSIM的高斯窗口
+        reduction   : 'mean'（目前仅支持）
         """
         super().__init__()
+        self.mean = mean
+        self.std = std
+        self.ssim_weight = ssim_weight
         self.window_size = window_size
-        self.size_average = size_average
-        self.channel = 1
-        self.window = self.create_window(window_size, self.channel)
+        self.reduction = reduction
 
-    def gaussian(self, window_size, sigma):
-        """
-            Get the gaussian kernel which will be used in SSIM computation
-        """
-        gauss = torch.Tensor([exp(-(x - window_size//2)**2/float(2*sigma**2)) for x in range(window_size)])
-        return gauss/gauss.sum()
-
-    def create_window(self, window_size, channel):
-        """
-            Create the gaussian window
-        """
-        _1D_window = self.gaussian(window_size, 1.5).unsqueeze(1)   # [window_size, 1]
-        _2D_window = _1D_window.mm(_1D_window.t()).float().unsqueeze(0).unsqueeze(0) # [1,1,window_size, window_size]
-        window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
+    @staticmethod
+    def _create_gaussian_window(window_size, channel, sigma=1.5, device='cpu', dtype=torch.float32):
+        gauss_1d = torch.tensor(
+            [math.exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)],
+            dtype=dtype, device=device
+        )
+        gauss_1d = gauss_1d / gauss_1d.sum()
+        _1D = gauss_1d.unsqueeze(1)                    # [K,1]
+        _2D = _1D @ _1D.t()                            # [K,K]
+        window = _2D.unsqueeze(0).unsqueeze(0)         # [1,1,K,K]
+        window = window.expand(channel, 1, window_size, window_size).contiguous()  # [C,1,K,K]
         return window
 
-    def _ssim(self, img1, img2, window, window_size, channel, size_average=True):
-        """
-            Compute the SSIM for the given two image
-            The original source is here: https://stackoverflow.com/questions/39051451/ssim-ms-ssim-for-tensorflow
-        """
-        mu1 = F.conv2d(img1, window, padding = window_size//2, groups = channel)
-        mu2 = F.conv2d(img2, window, padding = window_size//2, groups = channel)
+    def _ssim(self, x, y):
+        # x,y ∈ [0,1]
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+        K = self.window_size
+        window = self._create_gaussian_window(K, C, device=device, dtype=dtype)
 
-        mu1_sq = mu1.pow(2)
-        mu2_sq = mu2.pow(2)
-        mu1_mu2 = mu1*mu2
+        mu_x = F.conv2d(x, window, padding=K // 2, groups=C)
+        mu_y = F.conv2d(y, window, padding=K // 2, groups=C)
 
-        sigma1_sq = F.conv2d(img1*img1, window, padding = window_size//2, groups = channel) - mu1_sq
-        sigma2_sq = F.conv2d(img2*img2, window, padding = window_size//2, groups = channel) - mu2_sq
-        sigma12 = F.conv2d(img1*img2, window, padding = window_size//2, groups = channel) - mu1_mu2
+        mu_x2 = mu_x.pow(2)
+        mu_y2 = mu_y.pow(2)
+        mu_xy = mu_x * mu_y
 
-        C1 = 0.01**2
-        C2 = 0.03**2
+        sigma_x2 = F.conv2d(x * x, window, padding=K // 2, groups=C) - mu_x2
+        sigma_y2 = F.conv2d(y * y, window, padding=K // 2, groups=C) - mu_y2
+        sigma_xy = F.conv2d(x * y, window, padding=K // 2, groups=C) - mu_xy
 
-        ssim_map = ((2*mu1_mu2 + C1)*(2*sigma12 + C2))/((mu1_sq + mu2_sq + C1)*(sigma1_sq + sigma2_sq + C2))
+        C1 = (0.01) ** 2
+        C2 = (0.03) ** 2
 
-        if size_average:
-            return ssim_map.mean()
-        else:
-            return ssim_map.mean(1).mean(1).mean(1)
+        ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / ((mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2))
+        return ssim_map.mean()
+
+    def _denorm01(self, x_norm):
+        # x_norm: Normalize域 -> 反归一化到[0,1]
+        x = x_norm * self.std + self.mean
+        return torch.clamp(x, 0.0, 1.0)
 
     def forward(self, image_in, image_out):
+        """
+        image_in  : 目标（Normalize域）
+        image_out : 预测（Normalize域）
+        返回：total_loss, mse_loss, ssim_loss
+        """
+        x = self._denorm01(image_in)
+        y = self._denorm01(image_out)
 
-        # Check if need to create the gaussian window
-        (_, channel, _, _) = image_in.size()
-        if channel == self.channel and self.window.data.type() == image_in.data.type():
-            pass
-        else:
-            window = self.create_window(self.window_size, channel)
-            window = window.to(image_out.get_device())
-            window = window.type_as(image_in)
-            self.window = window
-            self.channel = channel
+        mse = F.mse_loss(y, x, reduction='mean')
+        ssim_val = self._ssim(y, x)
+        l_ssim = 1.0 - ssim_val
 
-        # Lp
-        Lp = torch.sqrt(torch.sum(torch.pow((image_in - image_out), 2)))  # 二范数
-        # Lp = torch.sum(torch.abs(image_in - image_out))  # 一范数
-        # Lssim
-        Lssim = 1 - self._ssim(image_in, image_out, self.window, self.window_size, self.channel, self.size_average)
-        return Lp + Lssim * 1000, Lp, Lssim * 1000
+        total = mse + self.ssim_weight * l_ssim
+        return total, mse.detach(), l_ssim.detach()
